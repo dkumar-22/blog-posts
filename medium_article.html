@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta property="article:published_time" content="2026-02-14T09:00:00.000Z">
+    <meta property="og:title" content="Reducing Latency in Asynchronous Microservices: From 3 Seconds to 100ms">
+    <meta property="og:description" content="How we optimized a message-driven architecture to handle cross-region async processing with idempotency and resilience">
+    <title>Reducing Latency in Asynchronous Microservices: From 3 Seconds to 100ms</title>
+</head>
+<body>
+    <article>
+        <h1>Reducing Latency in Asynchronous Microservices: From 3 Seconds to 100ms</h1>
+        
+        <p><em>How we transformed a blocking synchronous architecture into a resilient async system while maintaining data consistency and retry capabilities</em></p>
+
+        <h2>The Problem</h2>
+        
+        <p>When building distributed systems, one of the most common challenges is dealing with synchronous calls that block your entire request pipeline. Our middleware service—built on Apache Camel—was orchestrating message processing across multiple downstream services. The flow looked simple enough:</p>
+
+        <ol>
+            <li>Receive message from queue</li>
+            <li>Call downstream service synchronously</li>
+            <li>Wait for response (up to 3 seconds)</li>
+            <li>Acknowledge or retry based on response</li>
+        </ol>
+
+        <p>The downstream service performed several operations: database writes, cloud storage movements (like moving files between S3 buckets), and potentially sending notifications. These operations were critical and needed to complete successfully, but they were also time-consuming.</p>
+
+        <p><strong>The core issue:</strong> Our middleware was waiting 3 seconds for each message, creating a bottleneck. With thousands of messages per day and concurrent processing enabled, this synchronous blocking was killing our throughput.</p>
+
+        <h2>The Challenge: Cross-Region Complexity</h2>
+
+        <p>Adding to the complexity, our downstream service could be deployed in a different region than the middleware. This meant:</p>
+
+        <ul>
+            <li>Higher network latency for API calls</li>
+            <li>Potential for regional failures</li>
+            <li>Callbacks might face network issues when returning results</li>
+        </ul>
+
+        <p>We needed a solution that would:</p>
+        <ol>
+            <li>Make the middleware respond quickly (reduce blocking time)</li>
+            <li>Ensure the downstream service still completed all operations reliably</li>
+            <li>Maintain idempotency (prevent duplicate processing on retries)</li>
+            <li>Preserve the middleware's role as the orchestrator for retries</li>
+        </ol>
+
+        <h2>The Solution: Async Processing with Smart Orchestration</h2>
+
+        <h3>Step 1: Make the Downstream Service Return Immediately</h3>
+
+        <p>The first breakthrough was realizing the downstream service didn't need to complete everything before responding. Instead:</p>
+
+        <pre><code>// Before
+receive_request() {
+    move_files_in_storage()  // 2.5 seconds
+    update_database()        // 400ms
+    send_notifications()     // 100ms
+    return success           // Total: 3+ seconds
+}
+
+// After
+receive_request() {
+    check_idempotency()      // 50ms
+    save_to_db(PENDING)      // 50ms
+    return 202 ACCEPTED      // Total: 100ms
+    
+    // Process asynchronously
+    background_worker {
+        move_files_in_storage()
+        update_database()
+        send_callback_to_middleware()
+    }
+}</code></pre>
+
+        <h3>Step 2: Implement Idempotency Checks</h3>
+
+        <p>Since we were moving to an async model where retries were inevitable, idempotency became critical. Every request now includes a unique identifier (like an email ID or transaction ID).</p>
+
+        <p>Before processing, the downstream service checks:</p>
+
+        <pre><code>idempotency_check(request_id) {
+    status = db.get_status(request_id)
+    
+    if status == COMPLETED:
+        return 200 OK  // Already processed
+    
+    if status == PROCESSING:
+        return 200 OK  // Currently being processed
+    
+    if status == null or FAILED:
+        db.insert(request_id, PENDING)
+        return 202 ACCEPTED  // New request, will process
+}</code></pre>
+
+        <p>This ensures that even if the middleware retries due to network issues or timeouts, we never process the same request twice.</p>
+
+        <h3>Step 3: Queue-Based Orchestration</h3>
+
+        <p>The middleware manages three queues:</p>
+
+        <ul>
+            <li><strong>pending:</strong> Messages waiting to be processed</li>
+            <li><strong>in-progress:</strong> Messages currently being processed by downstream service</li>
+            <li><strong>dlq (dead letter queue):</strong> Messages that failed after maximum retry attempts</li>
+        </ul>
+
+        <p>Flow:</p>
+
+        <pre><code>1. Consume from 'pending' queue
+2. Call downstream service
+3. If 202 received → Move to 'in-progress' queue
+4. Wait for callback from downstream service
+5. Success callback → ACK (remove from queue)
+6. Failure callback → Move back to 'pending' (retry) or 'dlq' (max retries exceeded)</code></pre>
+
+        <h3>Step 4: Callback Mechanism with Retry</h3>
+
+        <p>The downstream service sends callbacks to inform the middleware of the final result. To make this reliable:</p>
+
+        <ul>
+            <li>Track callback status in database (PENDING, DELIVERED, FAILED)</li>
+            <li>Retry failed callbacks with exponential backoff (30s, 1min, 2min, 5min)</li>
+            <li>After max retries, alert operations team for manual intervention</li>
+        </ul>
+
+        <h3>Step 5: Handling Stuck Messages</h3>
+
+        <p>One edge case: what if a message gets stuck in 'in-progress' because the downstream service crashed or the callback was lost?</p>
+
+        <p>Solution: A timeout monitor runs every 5 minutes and moves messages stuck in 'in-progress' for more than 10 minutes back to 'pending'. The idempotency check ensures these won't be processed twice—if they were already completed, the service returns 200 on retry.</p>
+
+        <h2>Handling Data Consistency</h2>
+
+        <p>One critical requirement was maintaining transactional consistency between storage operations and database updates. Our approach:</p>
+
+        <ol>
+            <li><strong>State Machine Pattern:</strong> Track status transitions (PENDING → PROCESSING → COMPLETED/FAILED)</li>
+            <li><strong>Database First:</strong> Always update the database before deleting old storage files</li>
+            <li><strong>Compensation Logic:</strong> If storage succeeds but database fails, mark as FAILED and retry the entire operation</li>
+        </ol>
+
+        <p>The key insight: Storage operations (like S3 moves) are idempotent. Copying the same file twice produces the same result. So retrying the entire operation is safe.</p>
+
+        <h2>The Challenge of Selective Retry with RabbitMQ</h2>
+
+        <p>One interesting problem we encountered: With concurrent processing (5 worker threads), we might have 10 messages being processed simultaneously. When callbacks arrive saying "message 4 and 7 failed," how do we selectively retry just those messages?</p>
+
+        <p><strong>The RabbitMQ limitation:</strong> You cannot selectively consume specific messages from the middle of a queue. RabbitMQ is FIFO (First In, First Out).</p>
+
+        <p><strong>Our solution:</strong> Fan-out pattern—write each message to both:</p>
+        <ul>
+            <li><strong>RabbitMQ queue:</strong> For ordering and distribution</li>
+            <li><strong>Cache/Database:</strong> For storing the original message content</li>
+        </ul>
+
+        <p>When a failure callback arrives with a correlation ID:</p>
+        <ol>
+            <li>Look up the original message in cache using correlation ID</li>
+            <li>Retrieve the full message content</li>
+            <li>Increment retry counter</li>
+            <li>Re-publish to 'pending' queue with original content</li>
+        </ol>
+
+        <p><em>Note: If you're using Kafka instead of RabbitMQ, this is simpler—Kafka messages aren't deleted on consumption and support offset-based replay naturally.</em></p>
+
+        <h2>Results</h2>
+
+        <p>After implementing this architecture:</p>
+
+        <ul>
+            <li><strong>Middleware latency:</strong> Reduced from 3 seconds to <100ms (97% improvement)</li>
+            <li><strong>Throughput:</strong> Increased by 30x (can process 30 messages in the time it took to process 1)</li>
+            <li><strong>Reliability:</strong> Zero duplicate processing due to idempotency</li>
+            <li><strong>Resilience:</strong> Automatic retry for transient failures, DLQ for permanent failures</li>
+            <li><strong>Cross-region support:</strong> Works reliably even with higher network latency</li>
+        </ul>
+
+        <h2>Key Takeaways</h2>
+
+        <ol>
+            <li><strong>Async is not just about threads:</strong> It's about changing your API contract. Return 202 Accepted and process in the background.</li>
+            
+            <li><strong>Idempotency is non-negotiable:</strong> In async systems with retries, idempotency checks prevent data corruption.</li>
+            
+            <li><strong>Middleware should orchestrate, not wait:</strong> Let downstream services manage their internal processing. Middleware should manage flow and retries.</li>
+            
+            <li><strong>Queue + Storage pattern:</strong> Use message queues for ordering/distribution, use cache/DB for message persistence during async processing.</li>
+            
+            <li><strong>State machines are your friend:</strong> Explicit state tracking (PENDING → PROCESSING → COMPLETED) makes systems debuggable and predictable.</li>
+            
+            <li><strong>Plan for failure:</strong> Callbacks can fail. Network can fail. Services can crash. Design for it upfront with retries, timeouts, and DLQs.</li>
+        </ol>
+
+        <h2>Considerations and Trade-offs</h2>
+
+        <p><strong>Eventual Consistency:</strong> The middleware gets a 202 immediately, but the actual processing completes later (usually within seconds). This is fine for most use cases, but if you need strong consistency, you'll need a different approach.</p>
+
+        <p><strong>Operational Complexity:</strong> Async systems are harder to debug. You need good observability—metrics, logs, and traces that connect requests with their async processing and callbacks.</p>
+
+        <p><strong>Message Storage:</strong> Storing messages in cache/DB during processing adds infrastructure. We used Redis with TTL to automatically clean up after processing completes.</p>
+
+        <h2>When NOT to Use This Pattern</h2>
+
+        <p>This architecture works well for:</p>
+        <ul>
+            <li>High-volume message processing</li>
+            <li>Operations that take >1 second</li>
+            <li>Systems where eventual consistency is acceptable</li>
+            <li>Cross-region deployments with variable latency</li>
+        </ul>
+
+        <p>Consider synchronous processing if:</p>
+        <ul>
+            <li>Operations complete in <100ms</li>
+            <li>You need immediate confirmation of success/failure</li>
+            <li>Your system is simple and doesn't justify the async complexity</li>
+        </ul>
+
+        <h2>Final Thoughts</h2>
+
+        <p>Moving from synchronous to asynchronous processing isn't just a technical change—it's a shift in how you think about distributed systems. Instead of "call and wait," you move to "trigger and track." Instead of hoping networks are fast, you design for them to be slow and unreliable.</p>
+
+        <p>The result? Systems that are faster, more resilient, and can scale horizontally without hitting blocking bottlenecks.</p>
+
+        <p>If you're dealing with similar latency issues in your microservices architecture, start by identifying your slowest synchronous calls and ask: "Does this really need to be synchronous?" Often, the answer is no—and that's your opportunity to optimize.</p>
+
+        <hr>
+
+        <p><em>Have you implemented async processing patterns in your systems? What challenges did you face? I'd love to hear about your experiences in the comments.</em></p>
+
+    </article>
+</body>
+</html>
